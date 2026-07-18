@@ -1,0 +1,54 @@
+name: Book drop-in class
+
+on:
+  workflow_dispatch: {}   # lets you trigger a manual test run from the Actions tab
+  schedule:
+    # Runs weekly. Adjust the minute/hour/day-of-week to a few minutes
+    # BEFORE your class's registration window opens (registration opened
+    # exactly 6 days before class start, in the one example we captured).
+    #
+    # Cron is in UTC and GitHub does NOT adjust for US daylight saving
+    # time, so you may need two schedule lines (one for EDT, one for EST)
+    # or to nudge this twice a year. Example below assumes a class that
+    # opens registration Wednesdays at 08:00 America/New_York:
+    #   - EDT (UTC-4, roughly Mar-Nov): 08:00 ET = 12:00 UTC
+    #   - EST (UTC-5, roughly Nov-Mar): 08:00 ET = 13:00 UTC
+    - cron: "55 11 * * 3"   # ~5 min early, EDT
+    - cron: "55 12 * * 3"   # ~5 min early, EST
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run booking script
+        env:
+          REC_EMAIL: ${{ secrets.REC_EMAIL }}
+          REC_PASSWORD: ${{ secrets.REC_PASSWORD }}
+          CLASS_NAME: ${{ vars.CLASS_NAME }}
+          TARGET_WEEKDAY: ${{ vars.TARGET_WEEKDAY }}
+          TARGET_TIME: ${{ vars.TARGET_TIME }}
+          PARTICIPANT_NAME: ${{ vars.PARTICIPANT_NAME }}
+          MEMBERSHIP_NAME: ${{ vars.MEMBERSHIP_NAME }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
+          MAX_WAIT_MINUTES: "10"
+        run: python book_class.py
+
+      - name: Upload screenshots (debugging)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: booking-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
