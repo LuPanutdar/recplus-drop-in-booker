@@ -71,6 +71,77 @@ BASE_URL = "https://customer.recplus.cityofmyrtlebeach.com"
 SENSITIVE_TEXTS = []
 
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+WEEKDAY_RE = re.compile(r"(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)", re.I)
+TIME_HINT_RE = re.compile(r"\d{1,2}:\d{2}\s*(am|pm)?", re.I)
+
+
+def time_matches(target_time, text):
+    """
+    TARGET_TIME is configured as 24h "HH:MM" (e.g. "08:00"), but the site
+    may render times as 12h with AM/PM and no leading zero (e.g. "8:00 AM").
+    Check every reasonable rendering rather than a single exact substring.
+    """
+    hour, minute = map(int, target_time.split(":"))
+    period = "AM" if hour < 12 else "PM"
+    hour12 = hour % 12 or 12
+    candidates = {
+        f"{hour:02d}:{minute:02d}",
+        f"{hour}:{minute:02d}",
+        f"{hour12}:{minute:02d} {period}",
+        f"{hour12}:{minute:02d}{period}",
+        f"{hour12:02d}:{minute:02d} {period}",
+    }
+    text_low = text.lower()
+    return any(c.lower() in text_low for c in candidates)
+
+
+def get_context_text(card, max_level=8):
+    """
+    get_by_text() locates the exact node containing the class name, which
+    is often just that one text node/leaf element -- not the surrounding
+    card with the date/time on it. Walk up the DOM one ancestor at a time
+    until we hit a level whose text includes a weekday name or something
+    that looks like a time, since we don't know the site's actual card
+    markup (no live DOM access when this was written).
+    """
+    text = card.inner_text()
+    for level in range(1, max_level + 1):
+        container = card.locator(f"xpath=ancestor::*[{level}]")
+        if container.count() == 0:
+            break
+        candidate = container.inner_text()
+        text = candidate  # widen the fallback even if no hint matches yet
+        if WEEKDAY_RE.search(candidate) or TIME_HINT_RE.search(candidate):
+            return candidate
+    return text
+
+
+def dump_dom_debug(card, max_level=10):
+    """
+    One-time diagnostic: when we can't find the right occurrence, print the
+    actual HTML/structure around a matched element straight to the log
+    (plain text, safe to paste back) so the real markup can be inspected
+    without needing a screenshot or live browser access.
+    """
+    try:
+        own_html = card.evaluate("el => el.outerHTML")
+    except Exception as e:
+        own_html = f"<error reading outerHTML: {e}>"
+    log.info("DEBUG matched element outerHTML: %s", redact(own_html[:1000]))
+
+    for level in range(1, max_level + 1):
+        container = card.locator(f"xpath=ancestor::*[{level}]")
+        if container.count() == 0:
+            log.info("DEBUG ancestor level %d: <axis exhausted, no element>", level)
+            break
+        try:
+            info = container.evaluate(
+                "el => ({tag: el.tagName, cls: el.className, "
+                "text: (el.innerText || '').slice(0,200)})"
+            )
+        except Exception as e:
+            info = {"error": str(e)}
+        log.info("DEBUG ancestor level %d: %s", level, redact(str(info)))
 
 
 def env(name, required=True, default=None):
@@ -198,14 +269,12 @@ def find_and_open_class(page, class_name, target_weekday, target_time):
     log.info("Found %d card(s) matching '%s'", count, class_name)
 
     target_label = f"{target_weekday}"  # e.g. "Tuesday"
+    seen = []
     for i in range(count):
         card = cards.nth(i)
-        # Walk up to the enclosing card container to read its full text
-        container = card.locator(
-            "xpath=ancestor::*[self::article or self::li or contains(@class,'card')][1]"
-        )
-        text = (container.inner_text() if container.count() > 0 else card.inner_text())
-        if target_label.lower() in text.lower() and target_time in text:
+        text = get_context_text(card)
+        seen.append(text)
+        if target_label.lower() in text.lower() and time_matches(target_time, text):
             log.info("Matched occurrence: %s", redact(text.replace("\n", " | ")))
             card.click()
             return True
@@ -213,8 +282,11 @@ def find_and_open_class(page, class_name, target_weekday, target_time):
     log.error(
         "No occurrence of '%s' found for %s at %s. Occurrences seen: %s",
         class_name, target_weekday, target_time,
-        [redact(cards.nth(i).inner_text()) for i in range(count)],
+        [redact(t.replace("\n", " | ")) for t in seen],
     )
+    if count > 0:
+        dump_dom_debug(cards.nth(0))
+    masked_screenshot(page, "error_class_not_matched.png")
     return False
 
 
