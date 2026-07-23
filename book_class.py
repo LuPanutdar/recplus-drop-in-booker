@@ -11,25 +11,18 @@ function hash that changes on every deployment, and the site's session
 cookies are httpOnly/opaque, so there is no reliable way to POST a booking
 directly with `requests`. Instead this script drives a real (headless)
 browser with Playwright and clicks through the same UI a person would use.
-That means it depends on a handful of CSS/text selectors on the live site,
-marked below with "SELECTOR:" comments. If Rec+ changes their frontend,
-these are the lines you'll need to fix.
 
-HOW TO FINALIZE THE SELECTORS
-------------------------------
-Selectors below are best-effort (based on the site's visible copy and a
-captured HAR of a real booking), but were not verified against the live
-rendered DOM. Before relying on this for a real registration:
-
-    pip install playwright
-    playwright install chromium
-    playwright codegen https://customer.recplus.cityofmyrtlebeach.com/login
-
-`codegen` opens a real browser and records your clicks as Playwright code.
-Log in, open Drop-Ins, find your class, and click through a real (or
-almost-real, then cancel before the final confirm) booking. Compare the
-generated locators to the ones marked SELECTOR below and patch any that
-differ.
+CONFIRMED LIVE BEHAVIOR (from a real captured run)
+----------------------------------------------------
+- Each Drop-Ins card shows an explicit calendar date, e.g. "Jul 28, 2026",
+  NOT a weekday name. TARGET_WEEKDAY is matched by computing the weekday
+  from that date ourselves, not by looking for the weekday name as text.
+- Times render as a 12h range with AM/PM, e.g. "8:00 AM — 8:45 AM".
+- The "Register" button is inline on each occurrence's own card in the
+  list -- there is no separate detail page to click through to. The
+  script clicks the Register button scoped to the specific matched card,
+  not a page-wide search (multiple cards can each have their own visible
+  "Register" button at once).
 
 CONFIGURATION (environment variables)
 --------------------------------------
@@ -73,13 +66,15 @@ SENSITIVE_TEXTS = []
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 WEEKDAY_RE = re.compile(r"(Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)", re.I)
 TIME_HINT_RE = re.compile(r"\d{1,2}:\d{2}\s*(am|pm)?", re.I)
+# Matches dates like "Jul 28, 2026" -- confirmed live rendering on this site.
+MONTH_DATE_RE = re.compile(r"\b([A-Za-z]{3,9})\s+(\d{1,2}),\s*(\d{4})\b")
 
 
 def time_matches(target_time, text):
     """
-    TARGET_TIME is configured as 24h "HH:MM" (e.g. "08:00"), but the site
-    may render times as 12h with AM/PM and no leading zero (e.g. "8:00 AM").
-    Check every reasonable rendering rather than a single exact substring.
+    TARGET_TIME is configured as 24h "HH:MM" (e.g. "08:00"). Confirmed live
+    rendering is 12h with AM/PM and no leading zero (e.g. "8:00 AM"), so
+    check every reasonable rendering rather than a single exact substring.
     """
     hour, minute = map(int, target_time.split(":"))
     period = "AM" if hour < 12 else "PM"
@@ -95,33 +90,59 @@ def time_matches(target_time, text):
     return any(c.lower() in text_low for c in candidates)
 
 
-def get_context_text(card, max_level=8):
+def extract_weekday(text):
     """
-    get_by_text() locates the exact node containing the class name, which
-    is often just that one text node/leaf element -- not the surrounding
-    card with the date/time on it. Walk up the DOM one ancestor at a time
-    until we hit a level whose text includes a weekday name or something
-    that looks like a time, since we don't know the site's actual card
-    markup (no live DOM access when this was written).
+    Confirmed live behavior: the card shows an explicit calendar date
+    (e.g. "Jul 28, 2026"), never a weekday name. Parse the date and
+    compute its weekday ourselves rather than substring-matching a
+    weekday name that's never rendered.
+    """
+    m = MONTH_DATE_RE.search(text)
+    if not m:
+        return None
+    month_str, day_str, year_str = m.groups()
+    for fmt in ("%b %d %Y", "%B %d %Y"):
+        try:
+            dt = datetime.strptime(f"{month_str} {day_str} {year_str}", fmt)
+            return dt.strftime("%A")
+        except ValueError:
+            continue
+    return None
+
+
+def get_context_container(card, max_level=8):
+    """
+    get_by_text() locates the exact node containing the class name (often
+    just the title element) -- not the surrounding card with the
+    date/time/Register button on it. Walk up the DOM one ancestor at a
+    time until we hit a level whose text includes a date or time, which
+    (confirmed live) is the actual per-occurrence card container.
+
+    Returns (text, container_locator) for that level, so the caller can
+    both match against the text and later click controls (like the
+    Register button) scoped to that specific occurrence.
     """
     text = card.inner_text()
+    container = card
     for level in range(1, max_level + 1):
-        container = card.locator(f"xpath=ancestor::*[{level}]")
-        if container.count() == 0:
+        candidate_container = card.locator(f"xpath=ancestor::*[{level}]")
+        if candidate_container.count() == 0:
             break
-        candidate = container.inner_text()
-        text = candidate  # widen the fallback even if no hint matches yet
-        if WEEKDAY_RE.search(candidate) or TIME_HINT_RE.search(candidate):
-            return candidate
-    return text
+        candidate_text = candidate_container.inner_text()
+        text = candidate_text
+        container = candidate_container
+        if WEEKDAY_RE.search(candidate_text) or TIME_HINT_RE.search(candidate_text) \
+                or MONTH_DATE_RE.search(candidate_text):
+            return candidate_text, candidate_container
+    return text, container
 
 
 def dump_dom_debug(card, max_level=10):
     """
-    One-time diagnostic: when we can't find the right occurrence, print the
-    actual HTML/structure around a matched element straight to the log
-    (plain text, safe to paste back) so the real markup can be inspected
-    without needing a screenshot or live browser access.
+    Diagnostic: when we can't find the right occurrence, print the actual
+    HTML/structure around a matched element straight to the log (plain
+    text, safe to paste back) so the real markup can be inspected without
+    needing a screenshot or live browser access.
     """
     try:
         own_html = card.evaluate("el => el.outerHTML")
@@ -200,8 +221,6 @@ def masked_screenshot(page, path):
     try:
         page.screenshot(path=path, mask=mask_locators or None, mask_color="#000000")
     except Exception:
-        # Better to have an unmasked debug screenshot than none at all if
-        # masking itself errors out.
         log.warning("Screenshot masking failed, falling back to unmasked screenshot")
         page.screenshot(path=path)
 
@@ -210,16 +229,10 @@ def login(page, email, password):
     log.info("Logging in as %s", mask_email(email))
     page.goto(f"{BASE_URL}/login", wait_until="networkidle")
 
-    # SELECTOR: login form fields. The site's HTML `name` attributes for
-    # these are internal (e.g. "_1_email"), so we match on visible
-    # label/placeholder text instead, which is more resilient to redeploys.
     page.get_by_label("Email", exact=False).fill(email)
     page.get_by_label("Password", exact=False).fill(password)
-
-    # SELECTOR: submit button.
     page.get_by_role("button", name="Sign in", exact=False).click()
 
-    # A successful login redirects to /account.
     page.wait_for_url(f"{BASE_URL}/account*", timeout=15000)
     log.info("Login successful")
 
@@ -234,7 +247,7 @@ def select_participant_and_membership(page, participant_name, membership_name):
     """
     try:
         # SELECTOR: participant dropdown/list, only appears if account has
-        # multiple family members on it.
+        # multiple family members on it. Not yet verified live.
         participant_picker = page.get_by_role("radio").or_(page.get_by_role("option"))
         if participant_name and participant_picker.count() > 0:
             page.get_by_text(participant_name, exact=False).first.click()
@@ -242,42 +255,44 @@ def select_participant_and_membership(page, participant_name, membership_name):
         pass
 
     try:
-        # SELECTOR: membership/subscription picker, only appears if the
-        # account has more than one eligible membership for this program.
+        # SELECTOR: membership/subscription picker. Not yet verified live.
         if membership_name:
             page.get_by_text(membership_name, exact=False).first.click()
     except PWTimeout:
         pass
 
 
-def find_and_open_class(page, class_name, target_weekday, target_time):
+def find_matching_container(page, class_name, target_weekday, target_time):
+    """
+    Returns the Locator for the specific occurrence's card if a match is
+    found, or None. Also returns the matched card so the caller can act
+    (click Register) scoped to that exact occurrence.
+    """
     log.info("Opening Drop-Ins page")
     page.goto(f"{BASE_URL}/drop-ins", wait_until="networkidle")
 
-    # SELECTOR: search/filter box on the Drop-Ins page.
     search_box = page.get_by_placeholder("Search", exact=False)
     if search_box.count() > 0:
         search_box.first.fill(class_name)
-        page.wait_for_timeout(1000)  # debounce
+        page.wait_for_timeout(1500)  # debounce
 
-    # SELECTOR: each class occurrence is rendered as a card with the class
-    # name and a date/time. We match on the class name text, then check
-    # each matching card's visible date/time text for the target weekday
-    # and time until we find the right occurrence.
     cards = page.get_by_text(class_name, exact=False)
     count = cards.count()
     log.info("Found %d card(s) matching '%s'", count, class_name)
 
-    target_label = f"{target_weekday}"  # e.g. "Tuesday"
     seen = []
     for i in range(count):
         card = cards.nth(i)
-        text = get_context_text(card)
+        text, container = get_context_container(card)
         seen.append(text)
-        if target_label.lower() in text.lower() and time_matches(target_time, text):
+        occurrence_weekday = extract_weekday(text)
+        weekday_ok = (
+            occurrence_weekday is not None
+            and occurrence_weekday.lower() == target_weekday.lower()
+        )
+        if weekday_ok and time_matches(target_time, text):
             log.info("Matched occurrence: %s", redact(text.replace("\n", " | ")))
-            card.click()
-            return True
+            return container
 
     log.error(
         "No occurrence of '%s' found for %s at %s. Occurrences seen: %s",
@@ -287,19 +302,20 @@ def find_and_open_class(page, class_name, target_weekday, target_time):
     if count > 0:
         dump_dom_debug(cards.nth(0))
     masked_screenshot(page, "error_class_not_matched.png")
-    return False
+    return None
 
 
-def book_class(page, participant_name, membership_name, dry_run):
-    # SELECTOR: the class detail view's register/book button.
-    register_btn = page.get_by_role("button", name="Register", exact=False)
+def book_class(page, container, participant_name, membership_name, dry_run):
+    # SELECTOR: the Register button lives inline on the matched
+    # occurrence's own card (confirmed live) -- scope the search to this
+    # container so we don't accidentally click a different date's button.
+    register_btn = container.get_by_role("button", name="Register", exact=False)
     if register_btn.count() == 0:
-        register_btn = page.get_by_role("button", name="Book", exact=False)
-    if register_btn.count() == 0:
-        register_btn = page.get_by_role("button", name="Add to Cart", exact=False)
+        register_btn = container.get_by_text("Register", exact=False)
 
     if register_btn.count() == 0:
-        log.error("Could not find a Register/Book/Add to Cart button on the class page.")
+        log.error("Could not find a Register button on the matched card.")
+        masked_screenshot(page, "error_no_register_button.png")
         return False
 
     register_btn.first.click()
@@ -307,8 +323,7 @@ def book_class(page, participant_name, membership_name, dry_run):
 
     select_participant_and_membership(page, participant_name, membership_name)
 
-    # SELECTOR: final confirmation button, e.g. "Confirm", "Complete
-    # Registration", "Checkout". Adjust after a codegen run.
+    # SELECTOR: final confirmation button/modal -- not yet verified live.
     confirm_btn = page.get_by_role("button", name="Confirm", exact=False)
     if confirm_btn.count() == 0:
         confirm_btn = page.get_by_role("button", name="Checkout", exact=False)
@@ -328,7 +343,7 @@ def book_class(page, participant_name, membership_name, dry_run):
     confirm_btn.first.click()
     page.wait_for_timeout(2000)
 
-    # SELECTOR: success confirmation text. Adjust after a codegen run.
+    # SELECTOR: success confirmation text -- not yet verified live.
     success = page.get_by_text("success", exact=False).count() > 0 or \
         page.get_by_text("confirmed", exact=False).count() > 0 or \
         page.get_by_text("you're registered", exact=False).count() > 0
@@ -347,7 +362,6 @@ def run_once():
     membership_name = env("MEMBERSHIP_NAME", required=False)
     dry_run = env("DRY_RUN", required=False, default="false").lower() == "true"
 
-    # Anything screenshots/logs should redact for a public repo.
     SENSITIVE_TEXTS[:] = [email, participant_name, membership_name]
 
     with sync_playwright() as p:
@@ -357,11 +371,11 @@ def run_once():
         try:
             login(page, email, password)
 
-            found = find_and_open_class(page, class_name, target_weekday, target_time)
-            if not found:
+            container = find_matching_container(page, class_name, target_weekday, target_time)
+            if container is None:
                 return False
 
-            ok = book_class(page, participant_name, membership_name, dry_run)
+            ok = book_class(page, container, participant_name, membership_name, dry_run)
             if ok:
                 log.info("Booking flow completed successfully%s.", " (dry run)" if dry_run else "")
             else:
